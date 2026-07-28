@@ -1,0 +1,20 @@
+[project]
+name = "model"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.1",
+    "torch>=2.13.0",
+]
+
+[tool.uv]
+torch-backend = "auto"
+# WSL-only sandbox: don't resolve wheels for other platforms
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.0",
+]

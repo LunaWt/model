@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+
+checkpoints/
+data/
+runs/
+*.bin
+*.pt
+*.safetensors
+
+.pytest_cache/
+.ruff_cache/
