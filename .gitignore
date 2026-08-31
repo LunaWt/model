@@ -1,7 +1,16 @@
+# Local, personal: plan, dated ledger, architecture reading, working agreement
+notes/
+
+# Environment
 .venv/
 __pycache__/
 *.pyc
+.env
 
+# Papers and other downloaded sources
+*.pdf
+
+# Data and run artifacts
 checkpoints/
 data/
 runs/
@@ -9,5 +18,14 @@ runs/
 *.pt
 *.safetensors
 
+# Tool caches
 .pytest_cache/
 .ruff_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Parked files
+*.parked
