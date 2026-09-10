@@ -88,20 +88,9 @@ before being trusted.
 
 ## Layout
 
-- `model/` — `kda.py` and `kda_head.py` (Kimi Delta Attention, chunkwise and recurrent),
-  `model.py`, `losses.py` (chunked cross-entropy), `optim.py` (Muon + AdamW), `data.py`
-  (memmap loader over token shards, deterministic in `(seed, step)`), `generate.py`
-  (sampling with MLA-latent, KDA-state and short-conv caches), `configs.py`,
-  `compile_patch.py` (bf16 `torch.compile` on sm_75, which needs help).
-- `scripts/` — `train.py`; the JAX benchmark harnesses `bench_moe_jax.py` and
-  `bench_dense_jax.py`; `kaggle_run.py` (push → status → logs → output, there is no
-  interactive Kaggle session); `prof_ops.py` (reads the xplane locally); the tokenizer and
-  corpus pipeline; `loop_budget.py`, `router_load.py`, `eval_ckpt.py`, `compile_check.py`.
-- `tests/` — 176 tests over the KDA recurrence, the losses, the windowed attention, the
-  tokenizer and encoder, the loader, Muon, the loop, MoE dispatch and router balance, the
-  generation cache and the profiler reader.
-- `notes/` — `ledger.md` (what is settled, with the number and the run that settled it),
-  `k3_architecture.md`, `looped.md`.
+`model/` is the PyTorch model, `scripts/` the training loop and the benchmark harnesses
+(local, and batch-only on Kaggle), `tests/` the suite that pins them, `notes/` the ledger,
+the K3 tech-report reading and the looped track. `CLAUDE.md` maps every file one by one.
 
 ## Run
 
