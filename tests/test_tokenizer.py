@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 from tokenizers import Tokenizer
 
 TOKENIZER_PATH = Path("tokenizers/bpe_16384.json")

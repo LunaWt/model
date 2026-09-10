@@ -43,7 +43,15 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
-from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers, processors, trainers
+from tokenizers import (
+    Regex,
+    Tokenizer,
+    decoders,
+    models,
+    pre_tokenizers,
+    processors,
+    trainers,
+)
 
 SAMPLE = Path("data/tok_sample")
 OUT = Path("tokenizers")

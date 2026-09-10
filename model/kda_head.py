@@ -28,8 +28,72 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
+
+try:
+    from fla.ops.kda import chunk_kda as _fla_chunk_kda
+except Exception:          # noqa: BLE001
+    _fla_chunk_kda = None
+
+
+def kda_fla(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+) -> torch.Tensor:
+    """Та же рекуррентность, что kda_chunkwise, но ядром из flash-linear-attention.
+
+    Формы у нас (B, H, T, D), у fla — (B, T, H, D), поэтому оси меняются местами
+    на входе и на выходе. `scale=1.0`, потому что q уже L2-нормирован: своё
+    1/sqrt(D) fla применил бы поверх и изменил бы результат. `g` передаётся
+    готовым логарифмом затухания (use_gate_in_kernel=False).
+
+    Все пять тензоров приводятся к одному типу: ядро смешивает их в одном
+    `tl.dot`, и на разных типах Triton падает при компиляции, а не молча.
+    """
+    if _fla_chunk_kda is None:
+        raise RuntimeError("flash-linear-attention не установлен")
+    dt = q.dtype
+    o, _ = _fla_chunk_kda(
+        q.transpose(1, 2).contiguous(),
+        k.transpose(1, 2).contiguous(),
+        v.transpose(1, 2).to(dt).contiguous(),
+        g.transpose(1, 2).to(dt).contiguous(),
+        beta.transpose(1, 2).to(dt).contiguous(),
+        scale=1.0,
+        output_final_state=False,
+    )
+    return o.transpose(1, 2)
+
+
+def kda_fla_state(q, k, v, g, beta, state):
+    """Тот же вызов, но с переносом рекуррентного состояния: (o, S_final).
+
+    S имеет форму (B, H, d_k, d_v) — то самое S из формулы, по экземпляру на
+    (батч, голову). На T=1 берётся `fused_recurrent_kda`: chunk-ядро на одном
+    токене считает всю обвязку UT-преобразования впустую.
+
+    Сверено 2 сен: префилл 24 токенов chunk-ядром + 8 шагов рекуррентным против
+    одного прогона на всех 32 — расхождение выхода 1.6e-7, состояния 6.6e-7.
+    """
+    if _fla_chunk_kda is None:
+        raise RuntimeError("flash-linear-attention не установлен")
+    from fla.ops.kda import fused_recurrent_kda
+
+    dt = q.dtype
+    args = [t.transpose(1, 2).contiguous() for t in (q, k, v, g)]
+    args.append(beta.transpose(1, 2).contiguous())
+    args = [a.to(dt) for a in args]
+    fn = fused_recurrent_kda if q.shape[2] == 1 else _fla_chunk_kda
+    o, s = fn(*args, scale=1.0, initial_state=state, output_final_state=True)
+    return o.transpose(1, 2), s
+
+
+def fla_available() -> bool:
+    return _fla_chunk_kda is not None and torch.cuda.is_available()
 
 
 class ShortConv(nn.Module):
@@ -59,6 +123,18 @@ class ShortConv(nn.Module):
         x = self.conv(x)
         return x.transpose(1, 2)                     # обратно в (B, T, C)
 
+    def forward_cached(self, x: torch.Tensor, state: torch.Tensor | None):
+        """Для генерации: слева не нули, а K−1 предыдущих входов. -> (y, new_state).
+
+        Без этого первый токен каждого шага декодирования видел бы слева нули и
+        свёртка давала бы не то же самое, что при прогоне всей последовательности.
+        """
+        z = x.transpose(1, 2)
+        pad = self.kernel_size - 1
+        left = state if state is not None else z.new_zeros(z.shape[0], z.shape[1], pad)
+        z = torch.cat([left, z], dim=-1)
+        return self.conv(z).transpose(1, 2), z[..., z.shape[-1] - pad:]
+
 
 def kda_recurrent(
     q: torch.Tensor,
@@ -66,7 +142,9 @@ def kda_recurrent(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-) -> torch.Tensor:
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+):
     """Наивная рекуррентность — ЭТАЛОН. Один шаг на токен.
 
         S_t = (I − β_t k_t k_tᵀ) · Diag(α_t) · S_{t−1} + β_t k_t v_tᵀ
@@ -81,7 +159,7 @@ def kda_recurrent(
     """
     B, H, T, D = q.shape
     alpha = g.exp()
-    S = q.new_zeros(B, H, D, D)
+    S = q.new_zeros(B, H, D, D) if initial_state is None else initial_state.to(q.dtype)
     outs = []
     for t in range(T):
         S = alpha[:, :, t].unsqueeze(-1) * S
@@ -91,7 +169,8 @@ def kda_recurrent(
             "bhk,bhv->bhkv", k[:, :, t], delta
         )
         outs.append(torch.einsum("bhk,bhkv->bhv", q[:, :, t], S))
-    return torch.stack(outs, dim=2)
+    o = torch.stack(outs, dim=2)
+    return (o, S) if output_final_state else o
 
 
 def kda_chunkwise(
@@ -213,7 +292,14 @@ class KDA(nn.Module):
         dt_range    диапазон log-равномерной выборки dt для инициализации b_α;
                     (0.001, 0.1) — как в fla и в Mamba-2/GDN, откуда K3 её и
                     берёт («b_α initialized following [64, 24, 139]», стр. 5).
+        backend     чем считать рекуррентность:
+                    "fla"       — ядро flash-linear-attention (быстрое, только CUDA)
+                    "chunkwise" — наша chunkwise-форма
+                    "recurrent" — наивный цикл, эталон
+                    "auto"      — fla если есть CUDA и пакет, иначе chunkwise
     """
+
+    BACKENDS = ("auto", "fla", "chunkwise", "recurrent")
 
     def __init__(
         self,
@@ -225,11 +311,15 @@ class KDA(nn.Module):
         alpha_rank: int | None = None,
         dt_range: tuple[float, float] = (0.001, 0.1),
         chunk_size: int = 16,
+        backend: str = "auto",
     ):
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_head
         self.g_min = g_min
+        if backend not in self.BACKENDS:
+            raise ValueError(f"backend={backend!r}, ожидается один из {self.BACKENDS}")
+        self.backend = backend
         if chunk_size and chunk_size * abs(g_min) > 80.0:
             raise ValueError(
                 f"chunk_size={chunk_size} при g_min={g_min}: 1/Γ доходит до "
@@ -295,7 +385,17 @@ class KDA(nn.Module):
         B, T, _ = x.shape
         return x.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _recurrence(self, q, k, v, g, beta) -> torch.Tensor:
+        backend = self.backend
+        if backend == "auto":
+            backend = "fla" if (fla_available() and q.is_cuda) else "chunkwise"
+        if backend == "fla":
+            return kda_fla(q, k, v, g, beta)
+        if backend == "recurrent" or not self.chunk_size:
+            return kda_recurrent(q, k, v, g, beta)
+        return kda_chunkwise(q, k, v, g, beta, chunk=self.chunk_size)
+
+    def forward(self, x: torch.Tensor, cache: dict | None = None) -> torch.Tensor:
         B, T, _ = x.shape
         H, D = self.n_heads, self.d_head
 
@@ -304,9 +404,16 @@ class KDA(nn.Module):
         # работает по последней оси, и на склеенном (B,T,H*D) он нормировал бы
         # все головы как один вектор — тогда ‖k‖=1 внутри головы не гарантирован
         # и дельта-правило теряет устойчивость.
-        q = self._heads(F.silu(self.conv_q(self.W_q(x))))          # (B, H, T, D)
-        k = self._heads(F.silu(self.conv_k(self.W_k(x))))
-        v = self._heads(F.silu(self.conv_v(self.W_v(x))))
+        if cache is None:
+            qc, kc, vc = (conv(proj(x)) for conv, proj in (
+                (self.conv_q, self.W_q), (self.conv_k, self.W_k), (self.conv_v, self.W_v)))
+        else:
+            qc, cache["conv_q"] = self.conv_q.forward_cached(self.W_q(x), cache.get("conv_q"))
+            kc, cache["conv_k"] = self.conv_k.forward_cached(self.W_k(x), cache.get("conv_k"))
+            vc, cache["conv_v"] = self.conv_v.forward_cached(self.W_v(x), cache.get("conv_v"))
+        q = self._heads(F.silu(qc))                                # (B, H, T, D)
+        k = self._heads(F.silu(kc))
+        v = self._heads(F.silu(vc))
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
         # v НЕ нормируется: это содержимое памяти, его величина несёт смысл
@@ -323,10 +430,13 @@ class KDA(nn.Module):
 
         # --- рекуррентность ----------------------------------------------------
         # S: (B, H, d_k, d_v). Оси B и H — независимые экземпляры памяти.
-        if self.chunk_size:
-            o = kda_chunkwise(q, k, v, g, beta, chunk=self.chunk_size)
+        if cache is None:
+            o = self._recurrence(q, k, v, g, beta)
+        elif fla_available() and q.is_cuda and self.backend in ("auto", "fla"):
+            o, cache["S"] = kda_fla_state(q, k, v, g, beta, cache.get("S"))
         else:
-            o = kda_recurrent(q, k, v, g, beta)                    # эталон, медленно
+            o, cache["S"] = kda_recurrent(q, k, v, g, beta, cache.get("S"),
+                                          output_final_state=True)
         o = o.to(x.dtype)                                          # (B, H, T, d_v)
 
         # --- выход: RMSNorm (headwise) -> гейт -> W_o -------------------------

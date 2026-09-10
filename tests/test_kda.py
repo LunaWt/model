@@ -70,7 +70,7 @@ def test_gradients_match_recurrent():
         out = fn(*ins)
         (out * torch.arange(1, D + 1, dtype=DT)).sum().backward()
         grads.append([t.grad for t in ins])
-    for name, a, b in zip("q k v g beta".split(), *grads):
+    for name, a, b in zip(["q", "k", "v", "g", "beta"], *grads):
         assert (a - b).abs().max() < 1e-11, f"grad {name}: {(a - b).abs().max()}"
 
 

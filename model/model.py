@@ -20,11 +20,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from model.kda_head import KDA
-
 
 # =====================================================================
 # Конфиг
@@ -69,8 +68,23 @@ class K3Config:
     n_shared: int = 2                # K3 фиксирует N_s = 2
     top_k: int = 4
     expert_hidden: int = 256         # скрытая ширина routed-эксперта (внутри ℓ)
-    capacity_factor: float = 1.25    # запас «полки» эксперта; >1 — страховка от
-                                     # перекоса нагрузки, платится лишними FLOPs
+    # Запас «полки» эксперта — компромисс, а не оптимум. Замер 2 сен на
+    # чекпоинте A16/550 (scripts/router_load.py, 8 батчей):
+    #     cf     1.25   1.50   2.00   2.50   3.00
+    #     drop   .113   .068   .030   .017   .010    <- доля выброшенных слотов
+    #     ток/с  1172    971    722     —      —     <- цена по скорости
+    # Ёмкость входит в размер буфера экспертов линейно, поэтому bmm дорожает
+    # ровно во столько же раз: 1.25 -> 2.0 это −38% скорости за +8% доставленных
+    # слотов. На этой карте так себе сделка, отсюда 1.5.
+    # Откуда перекос, если QB его выравнивает: QB держит СРЕДНЮЮ нагрузку
+    # (пик/идеал по всем батчам сразу 1.08), а ёмкость проверяется на КАЖДОМ
+    # микро-батче, где пик/идеал 2.05. Разница — цена того, что при B=1 микро-батч
+    # это один кусок одного документа одной группы, а эксперты специализируются
+    # по домену. Настоящее лекарство — больше независимых документов в forward,
+    # а не запас ёмкости.
+    capacity_factor: float = 1.5
+    qb_iters: int = 4                # итераций чередующегося решателя QB на шаг
+                                     # (Algorithm 1, p. 44)
     shared_hidden: int = 256         # скрытая ширина shared-эксперта (при d_model)
     dense_hidden: int = 1024         # FFN первого (dense) слоя
 
@@ -83,8 +97,34 @@ class K3Config:
     # У нас 16 слоёв, 8 блоков дали бы по 2 слоя — сокращать почти нечего.
     n_blocks: int = 4
 
+    # --- looped (notes/looped.md) ---
+    # loop_span=(a, b) — слои a..b включительно исполняются loop_r раз подряд
+    # теми же весами. None -> обычный стек.
+    loop_span: tuple[int, int] | None = None
+    loop_r: int = 1
+    # SMELT шаг 5: вклад зациклённых подслоёв в частичную сумму блока делится
+    # на r, иначе одни и те же веса пишут в неё r раз в согласованную сторону.
+    loop_res_scale: bool = True
+
+    kda_backend: str = "auto"
+
+    def execution_order(self) -> list[int]:
+        if self.loop_span is None or self.loop_r == 1:
+            return list(range(self.n_layers))
+        a, b = self.loop_span
+        return (list(range(a)) + list(range(a, b + 1)) * self.loop_r
+                + list(range(b + 1, self.n_layers)))
+
     def __post_init__(self):
-        assert self.n_layers % self.n_blocks == 0, "n_layers должно делиться на n_blocks"
+        if self.loop_span is not None:
+            a, b = self.loop_span
+            assert 0 <= a <= b < self.n_layers, f"loop_span={self.loop_span} вне [0, {self.n_layers})"
+            assert self.loop_r >= 1
+        n_exec = len(self.execution_order())
+        assert n_exec % self.n_blocks == 0, (
+            f"исполнений {n_exec} не делится на n_blocks={self.n_blocks}; "
+            "блоки AttnRes режутся по исполнениям, а не по слоям"
+        )
 
 
 # =====================================================================
@@ -224,12 +264,22 @@ class GatedMLA(nn.Module):
         B, T, _ = x.shape
         return x.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: dict | None = None) -> torch.Tensor:
         B, T, _ = x.shape
         q = self._heads(self.W_uq(self.q_norm(self.W_dq(x))))
         c = self.kv_norm(self.W_dkv(x))          # (B, T, kv_latent) — это и кэшируется
+        if cache is not None:
+            past = cache.get("c")
+            c = c if past is None else torch.cat([past, c], dim=1)
+            cache["c"] = c
         k = self._heads(self.W_uk(c))
         v = self._heads(self.W_uv(c))
+        # причинная маска SDPA выравнивается по левому верхнему углу, поэтому при
+        # разной длине q и k она означала бы не то. Два поддерживаемых режима:
+        # префилл (длины равны, маска нужна) и декодирование по одному токену
+        # (q длины 1 смотрит на весь кэш, маска не нужна).
+        is_causal = c.shape[1] == T
+        assert is_causal or T == 1, f"частичный префилл не поддержан: T={T}, кэш={c.shape[1]}"
 
         # SDPA сам применит масштаб 1/sqrt(d_head) и причинную маску.
         #
@@ -246,7 +296,7 @@ class GatedMLA(nn.Module):
         # То есть fp32 здесь не «дороже и точнее», а прямо дешевле обоих.
         with torch.autocast(x.device.type, enabled=False):
             o = F.scaled_dot_product_attention(
-                q.float(), k.float(), v.float(), is_causal=True
+                q.float(), k.float(), v.float(), is_causal=is_causal
             )
         o = o.to(x.dtype).transpose(1, 2).reshape(B, T, self.n_heads * self.d_head)
         return self.W_o(torch.sigmoid(self.W_g(x)) * o)
@@ -289,8 +339,28 @@ class LatentMoE(nn.Module):
         self.register_buffer("qb_bias", torch.zeros(cfg.n_routed))
         # скоры роутера, накопленные за микро-батчи текущего шага оптимизатора
         self._scores: list[torch.Tensor] = []
+        # скоры текущего forward, по одному входу на визит: ключ — номер визита.
+        # Именно СЛОВАРЬ, а не список: при gradient checkpointing forward
+        # прогоняется второй раз в backward, и список бы удвоил выборку, а
+        # перезапись по ключу идемпотентна.
+        self._visit_scores: dict[int, torch.Tensor] = {}
+        # ёмкость по факту, а не по формуле — только для генерации, см.
+        # K3Model.set_full_capacity. По умолчанию ВЫКЛЮЧЕНО: путь обучения и
+        # замера val должен остаться ровно тем же.
+        self.full_capacity = False
 
     # ------------------------------------------------------------------
+    def harvest_scores(self) -> None:
+        """Перенести скоры текущего forward в накопитель шага оптимизатора.
+
+        Зовётся из цикла обучения ПОСЛЕ backward каждого микро-батча (см.
+        `K3Model.harvest_router_scores`). Разделение forward и накопления —
+        чтобы пересчёт под gradient checkpointing не удваивал выборку.
+        """
+        if self._visit_scores:
+            self._scores.append(torch.cat(list(self._visit_scores.values()), dim=0))
+            self._visit_scores.clear()
+
     @torch.no_grad()
     def update_router_bias(self) -> None:
         """Quantile Balancing, Eq. 14. Вызывается ИЗ ЦИКЛА ОБУЧЕНИЯ, раз на шаг
@@ -311,6 +381,14 @@ class LatentMoE(nn.Module):
             во втором проходе получится другая.
         Причинность сохраняется: bias, посчитанный по этому батчу, действует
         только со следующего шага. На инференсе заморожен (буфер не трогаем).
+
+        Это ЧЕРЕДУЮЩИЙСЯ решатель (Algorithm 1, p. 44), а не одна формула: порог
+        α зависит от b, а b — от α, и Eq. 14 это один шаг покоординатной
+        минимизации двойственной задачи. Замер 2 сен на статичной матрице скоров
+        (512 токенов, 32 эксперта, top-4, перекос 2.0): без биаса переполнение
+        0.454, после 1 итерации 0.0063, после 2 — ровно 0. Так что итерации
+        стоят почти ничего и доводят решение до точного, но ⚠️ **не они лечат
+        перекос, который виден в обучении** — см. `capacity_factor`.
         """
         if not self._scores:
             return
@@ -318,14 +396,17 @@ class LatentMoE(nn.Module):
         self._scores.clear()
 
         k, n = self.cfg.top_k, self.cfg.n_routed
-        # порог α_i: (k+1)-й по величине БИАСОВАННЫЙ скор токена i.
-        # Эксперт входит в Top-k токена i ровно если s_ij + b_j > α_i.
-        alpha = torch.topk(s + self.qb_bias, k + 1, dim=-1).values[:, -1:]   # (m, 1)
-        b_hat = -torch.quantile(s - alpha, 1.0 - k / n, dim=0)               # (n,)
-        # общий сдвиг Top-k не меняет -> убираем, чтобы bias не уплывал
-        self.qb_bias.copy_(b_hat - b_hat.mean())
+        b = self.qb_bias
+        for _ in range(self.cfg.qb_iters):
+            # порог α_i: (k+1)-й по величине БИАСОВАННЫЙ скор токена i.
+            # Эксперт входит в Top-k токена i ровно если s_ij + b_j > α_i.
+            alpha = torch.topk(s + b, k + 1, dim=-1).values[:, -1:]          # (m, 1)
+            b = -torch.quantile(s - alpha, 1.0 - k / n, dim=0)               # (n,)
+            # общий сдвиг Top-k не меняет -> убираем, чтобы bias не уплывал
+            b = b - b.mean()
+        self.qb_bias.copy_(b)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, visit: int = 0) -> torch.Tensor:
         B, T, d = x.shape
         m, k, n = B * T, self.cfg.top_k, self.cfg.n_routed
         flat = x.reshape(m, d)
@@ -371,7 +452,10 @@ class LatentMoE(nn.Module):
         counts.scatter_add_(0, slot_expert, torch.ones_like(slot_expert))
         starts = torch.cumsum(counts, 0) - counts              # начало полки каждого эксперта
         pos = torch.arange(m * k, device=x.device) - starts[sorted_expert]   # место внутри полки
-        cap = max(1, int(m * k / n * self.cfg.capacity_factor))
+        if self.full_capacity:
+            cap = max(1, int(counts.max().item()))
+        else:
+            cap = max(1, int(m * k / n * self.cfg.capacity_factor))
         overflow = pos >= cap
         # переполненные слоты сваливаем в служебную строку cap — её выход
         # никуда не пойдёт, потому что вес обнулён
@@ -398,7 +482,7 @@ class LatentMoE(nn.Module):
             y = y + exp(flat)
 
         if self.training:
-            self._scores.append(s.detach().float())
+            self._visit_scores[visit] = s.detach().float()
 
         return y.view(B, T, d)
 
@@ -449,7 +533,8 @@ class K3Model(nn.Module):
                                           cfg.mla_kv_latent, cfg.mla_q_latent))
             else:
                 self.attn.append(KDA(cfg.d_model, cfg.n_heads, cfg.d_head,
-                                     cfg.kda_conv_kernel, cfg.kda_g_min))
+                                     cfg.kda_conv_kernel, cfg.kda_g_min,
+                                     backend=cfg.kda_backend))
 
             # первый слой dense — «for stable training», повторено и в K3,
             # и в Kimi Linear
@@ -471,6 +556,11 @@ class K3Model(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight        # tied embeddings
 
+        self.execution_order = cfg.execution_order()
+        span = cfg.loop_span
+        self.looped_layers = frozenset(range(span[0], span[1] + 1)) if span else frozenset()
+        self.loop_scale = 1.0 / cfg.loop_r if (span and cfg.loop_res_scale) else 1.0
+
         self.apply(self._init_weights)
 
     @staticmethod
@@ -489,39 +579,89 @@ class K3Model(nn.Module):
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        # tokens: (B, T) int64 -> логиты (B, T, vocab)
+    def body(self, tokens: torch.Tensor, cache: dict | None = None) -> torch.Tensor:
+        """Стек без lm_head: (B, T) -> (B, T, d_model) после out_norm.
+
+        Отделено от `forward`, потому что chunked_cross_entropy сама умножает на
+        lm_head и логиты (B, T, V) материализовать не надо.
+
+        `cache` — состояние генерации, словарь по НОМЕРУ ИСПОЛНЕНИЯ (позиции в
+        `execution_order`), а не по номеру слоя: у зациклённого слоя два прохода
+        стоят в разных местах стека и памяти внимания у них разные.
+        """
         h0 = self.embed(tokens)
         blocks: list[torch.Tensor] = [h0]      # b_0, потом b_1 … b_N
         partial: torch.Tensor | None = None    # b_n^i, частичная сумма блока
-        per_block = self.cfg.n_layers // self.cfg.n_blocks
+        order = self.execution_order
+        per_block = len(order) // self.cfg.n_blocks
+        visits: dict[int, int] = {}
 
-        for layer in range(self.cfg.n_layers):
-            if layer % per_block == 0:
+        for step, layer in enumerate(order):
+            if step % per_block == 0:
                 partial = None                 # начался новый блок
 
-            for res, norm, sub in (
-                (self.res_attn[layer], self.attn_norm[layer], self.attn[layer]),
-                (self.res_ffn[layer], self.ffn_norm[layer], self.ffn[layer]),
+            visit = visits.get(layer, 0)
+            visits[layer] = visit + 1
+            scale = self.loop_scale if layer in self.looped_layers else 1.0
+
+            for is_attn, res, norm, sub in (
+                (True, self.res_attn[layer], self.attn_norm[layer], self.attn[layer]),
+                (False, self.res_ffn[layer], self.ffn_norm[layer], self.ffn[layer]),
             ):
                 sources = blocks if partial is None else blocks + [partial]
                 h = res(sources)
-                out = sub(norm(h))
+                if isinstance(sub, LatentMoE):
+                    out = sub(norm(h), visit=visit)
+                elif is_attn and cache is not None:
+                    out = sub(norm(h), cache=cache.setdefault(step, {}))
+                else:
+                    out = sub(norm(h))
+                out = out * scale if scale != 1.0 else out
                 partial = out if partial is None else partial + out
 
-            if (layer + 1) % per_block == 0:
+            if (step + 1) % per_block == 0:
                 blocks.append(partial)         # блок закрыт
                 partial = None
 
-        h = self.res_out(blocks)
-        return self.lm_head(self.out_norm(h))
+        return self.out_norm(self.res_out(blocks))
+
+    def forward(self, tokens: torch.Tensor, cache: dict | None = None) -> torch.Tensor:
+        # tokens: (B, T) int64 -> логиты (B, T, vocab)
+        return self.lm_head(self.body(tokens, cache))
+
+    def set_full_capacity(self, flag: bool) -> None:
+        """Снять/вернуть ограничение ёмкости экспертов. Для генерации — снять.
+
+        ⚠️ При фиксированной ёмкости модель НЕ причинна по токенам. Полка
+        эксперта размера `cap = m·k/n · capacity_factor` считается от числа
+        токенов В ЭТОМ forward, и лишние слоты выбрасываются — значит выход
+        токена зависит от того, какие ещё токены прогоняются рядом. При обучении
+        это стандартная практика MoE и цена за фиксированные формы, но при
+        генерации это означает, что префилл длины T и пошаговое декодирование
+        считают РАЗНОЕ. Замер 2 сен на `tiny`: расхождение логитов 0.38 при
+        одинаковых весах и входе; со снятой ёмкостью — 5e-7, то есть уровень
+        порядка суммирования.
+
+        Снятая ёмкость стоит одной синхронизации с хостом на слой (`counts.max()`),
+        поэтому в обучении её включать нельзя.
+        """
+        for ffn in self.ffn:
+            if isinstance(ffn, LatentMoE):
+                ffn.full_capacity = flag
+
+    def harvest_router_scores(self) -> None:
+        """Собрать скоры роутера после backward микро-батча (см. LatentMoE.harvest_scores)."""
+        for ffn in self.ffn:
+            if isinstance(ffn, LatentMoE):
+                ffn.harvest_scores()
 
     @torch.no_grad()
     def update_router_bias(self) -> None:
         """Обновить QB-bias во всех MoE-слоях. Звать из цикла обучения ПОСЛЕ
         optimizer.step(), один раз на шаг:
 
-            loss.backward(); opt.step(); opt.zero_grad()
+            loss.backward(); model.harvest_router_scores()
+            opt.step(); opt.zero_grad()
             model.update_router_bias()
         """
         for ffn in self.ffn:
@@ -530,15 +670,34 @@ class K3Model(nn.Module):
 
     # ------------------------------------------------------------------
     def count_params(self) -> dict[str, int]:
-        """Всего / активных на токен. Активные считаем вручную: routed-эксперты
-        участвуют только top_k из n_routed."""
+        """Всего / активных / исполняемых на токен.
+
+        `active` — различные параметры, участвующие в одном токене: routed-эксперты
+        считаются top_k из n_routed. У зациклённой модели этого мало: одни и те же
+        веса работают r раз, и прокси FLOPs — именно `executed`, сумма по порядку
+        исполнения, где повторный слой считается заново.
+        """
         total = sum(p.numel() for p in self.parameters())
-        inactive = 0
-        for ffn in self.ffn:
+
+        def layer_active(i: int) -> int:
+            n = sum(p.numel() for p in self.attn[i].parameters())
+            ffn = self.ffn[i]
+            n += sum(p.numel() for p in ffn.parameters())
             if isinstance(ffn, LatentMoE):
                 per_expert = sum(p.numel() for p in ffn.experts.parameters()) // self.cfg.n_routed
-                inactive += per_expert * (self.cfg.n_routed - self.cfg.top_k)
-        return {"total": total, "active": total - inactive}
+                n -= per_expert * (self.cfg.n_routed - self.cfg.top_k)
+            for mod in (self.attn_norm[i], self.ffn_norm[i], self.res_attn[i], self.res_ffn[i]):
+                n += sum(p.numel() for p in mod.parameters())
+            return n
+
+        per_layer = [layer_active(i) for i in range(self.cfg.n_layers)]
+        floor = self.embed.weight.numel() + sum(p.numel() for p in self.res_out.parameters()) \
+            + sum(p.numel() for p in self.out_norm.parameters())
+        return {
+            "total": total,
+            "active": floor + sum(per_layer),
+            "executed": floor + sum(per_layer[i] for i in self.execution_order),
+        }
 
 
 def param_groups(model: nn.Module, weight_decay: float = 0.1) -> list[dict]:
@@ -569,8 +728,9 @@ if __name__ == "__main__":
     cfg = K3Config()
     m = K3Model(cfg)
     n = m.count_params()
-    print(f"total  {n['total'] / 1e6:7.1f}M")
-    print(f"active {n['active'] / 1e6:7.1f}M")
+    print(f"total    {n['total'] / 1e6:7.1f}M")
+    print(f"active   {n['active'] / 1e6:7.1f}M")
+    print(f"executed {n['executed'] / 1e6:7.1f}M")
 
     tok = torch.randint(0, cfg.vocab_size, (2, 64))
     out = m(tok)

@@ -1,8 +1,9 @@
 # model — small-scale LM research 🧪
 
 Sandbox for real experiments on small LMs on one 6 GB GPU. **Not a portfolio piece** —
-breaking things and abandoning an experiment halfway is allowed. Current line:
-reimplementing the **Kimi K3** architecture at this scale.
+breaking things and abandoning an experiment halfway is allowed. Two lines run in parallel:
+reimplementing the **Kimi K3** architecture at this scale (main), and a **looped-transformer
+comparison** on top of it (`notes/looped.md`) that must never block the main one.
 
 ## Where things live
 
@@ -13,7 +14,7 @@ reimplementing the **Kimi K3** architecture at this scale.
 | `tokenizers/` | trained BPE vocabularies (`bpe_16384.json` is the one in use) |
 | `tests/` | pytest suite — `uv run pytest` |
 | `grok_review/` | one-off probes written to check claims from an external review |
-| `notes/` | **untracked.** Plan, dated ledger, architecture reading, working agreement |
+| `notes/` | **untracked.** Plan, dated ledger, architecture reading, working agreement, `looped.md` (parallel experiment track) |
 
 Plan and ledger are updated in-session when a step closes, not "later".
 

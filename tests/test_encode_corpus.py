@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from encode_corpus import DTYPE, ShardWriter, batched, open_writer  # noqa: E402
+from encode_corpus import DTYPE, ShardWriter, batched, open_writer
 
 
 def test_shards_roll_over_at_the_configured_size(tmp_path: Path) -> None:

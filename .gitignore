@@ -1,5 +1,9 @@
-# Local, personal: plan, dated ledger, architecture reading, working agreement
-notes/
+# Notes: technical ones are published, anything about Luna herself is not.
+# notes/* (not notes/) so the negations below can re-include single files.
+notes/*
+!notes/ledger.md
+!notes/k3_architecture.md
+!notes/looped.md
 
 # Environment
 .venv/

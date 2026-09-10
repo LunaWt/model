@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import zstandard
+
 from tokenizers import Tokenizer
 
 RAW = Path("data/raw")
@@ -51,6 +52,7 @@ def groups() -> dict[str, list[Path]]:
             (RAW / "dolma35/swallow-math/stage3-qa_decon_ngram_filtered").glob("*.jsonl.gz")
         ),
         "synth": sorted((RAW / "synth").glob("*.jsonl.gz")),
+        "science": sorted((RAW / "arxiv_cp").glob("*.json.gz")),
     }
 
 
@@ -63,7 +65,7 @@ def read_docs(path: Path) -> Iterator[str]:
             reader = zstandard.ZstdDecompressor().stream_reader(fh)
             for line in io.TextIOWrapper(reader, encoding="utf-8"):
                 yield json.loads(line)["text"]
-    elif path.name.endswith(".jsonl.gz"):
+    elif path.name.endswith((".jsonl.gz", ".json.gz")):
         with gzip.open(path, "rt", encoding="utf-8") as f:
             for line in f:
                 yield json.loads(line)["text"]
